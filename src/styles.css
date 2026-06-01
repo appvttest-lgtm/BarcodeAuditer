@@ -19,15 +19,13 @@ body { margin: 0; line-height: 1.45; }
 .hero h1 { margin: 0 0 4px; font-size: 34px; }
 .hero p { margin: 0; opacity: 0.94; }
 .ap-mark {
-  width: 46px;
-  height: 46px;
+  width: 180px;
+  max-width: 32vw;
+  height: auto;
+  display: block;
   background: white;
-  color: #d4001a;
-  border-radius: 50%;
-  display: grid;
-  place-items: center;
-  font-size: 36px;
-  font-weight: 900;
+  border-radius: 6px;
+  padding: 8px 10px;
 }
 .notice, .message {
   margin: 18px 0;

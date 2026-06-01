@@ -13,6 +13,7 @@ import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { readBarcodes as readWasmBarcodes, prepareZXingModule } from 'zxing-wasm/reader';
 import zxingReaderWasmUrl from 'zxing-wasm/reader/zxing_reader.wasm?url';
 import { auditLabel, groupValidations, SERVICE_CODE_MAP, SERVICE_TO_PRODUCT_MAP, PRODUCT_CODE_MAP, STARTRACK_PRODUCT_CODE_MAP, STARTRACK_LABEL_CODE_MAP } from './auditEngine.js';
+import australiaPostLogoUrl from '../Australia_Post_logo_logotype.png';
 import './styles.css';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
@@ -23,11 +24,17 @@ prepareZXingModule({
   }
 });
 
+// Formats requested from the browser-native BarcodeDetector API when it is available.
 const barcodeFormats = ['code_128', 'data_matrix', 'qr_code', 'pdf417', 'ean_13', 'ean_8'];
+
+// Internal scan-region categories used to tune crop transforms and route evidence in the report.
 const FORMAT_KIND = { linear: 'linear', datamatrix: 'datamatrix', qr: 'qr', mixed: 'mixed' };
 const APP_TITLE = 'Australia Post - eCommerce Integration Label Auditor';
+const ACCEPTED_LABEL_FILE_TYPES = 'application/pdf,image/png,image/jpeg,image/webp,image/bmp';
+const LABEL_FAMILY_NAMES = { eparcel: 'eParcel', startrack: 'StarTrack' };
+const BARCODE_BOX_MARGIN_PX = 36;
 
-
+// Converts ZXing's enum values into the same string labels used by browser-native scans.
 const zxingFormatMap = new Map([
   [BarcodeFormat.CODE_128, 'code_128'],
   [BarcodeFormat.DATA_MATRIX, 'data_matrix'],
@@ -41,10 +48,17 @@ const zxingFormatMap = new Map([
   [BarcodeFormat.CODE_93, 'code_93']
 ]);
 
+/** Returns the display name for a carrier-specific upload/audit path. */
+function labelFamilyName(labelFamily) {
+  return LABEL_FAMILY_NAMES[labelFamily] || LABEL_FAMILY_NAMES.eparcel;
+}
+
+/** Returns whether the current browser exposes the native BarcodeDetector API. */
 function canUseBarcodeDetector() {
   return 'BarcodeDetector' in window;
 }
 
+/** Creates a best-effort native barcode detector, falling back to null when unsupported. */
 async function createDetector() {
   if (!canUseBarcodeDetector()) return null;
   try {
@@ -63,6 +77,7 @@ async function createDetector() {
   }
 }
 
+/** Merges duplicate barcode reads while keeping the instance with the best location evidence. */
 function dedupeBarcodes(items) {
   const map = new Map();
   for (const item of items) {
@@ -94,6 +109,7 @@ function dedupeBarcodes(items) {
   return [...map.values()];
 }
 
+/** Reads barcodes from a canvas through the native browser BarcodeDetector. */
 async function detectWithBrowserBarcodeDetector(canvas, detector, pageNumber = 1, regionLabel = 'full-page') {
   if (!detector) return [];
   try {
@@ -118,6 +134,7 @@ async function detectWithBrowserBarcodeDetector(canvas, detector, pageNumber = 1
   }
 }
 
+/** Builds a configured ZXing JS reader for the requested symbologies. */
 function makeZxingReader(formats = ['Code128', 'DataMatrix']) {
   const formatMap = {
     Code128: BarcodeFormat.CODE_128,
@@ -139,6 +156,7 @@ function makeZxingReader(formats = ['Code128', 'DataMatrix']) {
   return reader;
 }
 
+/** Attempts one ZXing JS decode on a canvas and returns the app's normalized barcode shape. */
 function zxingDecodeCanvas(canvas, pageNumber = 1, regionLabel = 'full-page', formats = ['Code128', 'DataMatrix'], kind = FORMAT_KIND.mixed, variantLabel = 'original') {
   try {
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
@@ -165,6 +183,7 @@ function zxingDecodeCanvas(canvas, pageNumber = 1, regionLabel = 'full-page', fo
   }
 }
 
+/** Runs the stronger ZXing-WASM scanner over a canvas, including rotation/inversion/downscale attempts. */
 async function wasmDecodeCanvas(canvas, pageNumber = 1, regionLabel = 'full-page', formats = ['Code128', 'DataMatrix'], kind = FORMAT_KIND.mixed, variantLabel = 'original', options = {}) {
   try {
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
@@ -210,6 +229,7 @@ async function wasmDecodeCanvas(canvas, pageNumber = 1, regionLabel = 'full-page
   }
 }
 
+/** Converts ZXing result points into a rectangular crop/evidence box. */
 function pointsToBox(points) {
   const xs = points.map(p => p.getX());
   const ys = points.map(p => p.getY());
@@ -225,6 +245,7 @@ function pointsToBox(points) {
   };
 }
 
+/** Keeps a crop box inside the source canvas boundaries. */
 function clampBox(box, width, height) {
   if (!box) return null;
   const x = Math.max(0, Math.min(width - 1, Math.round(box.x || 0)));
@@ -234,9 +255,10 @@ function clampBox(box, width, height) {
   return { x, y, width: right - x, height: bottom - y };
 }
 
-function expandBox(box, padRatio, canvasWidth, canvasHeight, minPad = 24) {
+/** Adds a fixed visual/crop margin around a detected barcode box without exceeding the page. */
+function expandBox(box, canvasWidth, canvasHeight, marginPx = BARCODE_BOX_MARGIN_PX) {
   if (!box) return null;
-  const pad = Math.max(minPad, Math.round(Math.max(box.width, box.height) * padRatio));
+  const pad = Math.max(0, Math.round(marginPx));
   return clampBox({
     x: box.x - pad,
     y: box.y - pad,
@@ -245,6 +267,7 @@ function expandBox(box, padRatio, canvasWidth, canvasHeight, minPad = 24) {
   }, canvasWidth, canvasHeight);
 }
 
+/** Returns the user-facing barcode type label used in captions and reports. */
 function barcodeKindLabel(b) {
   if (isDataMatrixBarcode(b)) return 'GS1 DataMatrix';
   if (isQrBarcode(b)) return 'QR Barcode';
@@ -252,6 +275,7 @@ function barcodeKindLabel(b) {
   return b?.format || 'Barcode';
 }
 
+/** Maps a barcode read from a crop back into page-level coordinates. */
 function mapBarcodeToPage(barcode, target, variantLabel = '') {
   const base = { ...barcode };
   const targetBox = {
@@ -301,6 +325,12 @@ function imageBoxCaption(images = {}, kind = FORMAT_KIND.datamatrix) {
     const label = 'Detected StarTrack routing barcode location for this label';
     if (!box) return `${label} · fallback crop only`;
     return `${label} · box ${Math.round(box.x)},${Math.round(box.y)} ${Math.round(box.width)}×${Math.round(box.height)}px`;
+  }
+  if (kind === 'startrack-atl') {
+    const box = images.atlBarcodeBox;
+    const label = 'Detected StarTrack ATL barcode location for this label';
+    if (!box) return `${label} Â· fallback crop only`;
+    return `${label} Â· box ${Math.round(box.x)},${Math.round(box.y)} ${Math.round(box.width)}Ã—${Math.round(box.height)}px`;
   }
   if (kind === 'startrack-freight') {
     const box = images.freightBarcodeBox;
@@ -628,7 +658,7 @@ function canvasToDataUrlWithBarcodeBoxes(sourceCanvas, barcodes = [], maxWidth =
   ctx.lineWidth = Math.max(3, Math.round(4 * scale));
   ctx.font = `${Math.max(12, Math.round(18 * scale))}px Segoe UI, Arial, sans-serif`;
   for (const b of located) {
-    const box = expandBox(b.pageBoundingBox, isDataMatrixBarcode(b) ? 0.18 : 0.10, sourceCanvas.width, sourceCanvas.height, 12);
+    const box = expandBox(b.pageBoundingBox, sourceCanvas.width, sourceCanvas.height, BARCODE_BOX_MARGIN_PX);
     if (!box) continue;
     const x = box.x * scale;
     const y = box.y * scale;
@@ -656,7 +686,7 @@ function cropForDecodedBarcode(canvas, barcodes, kind) {
   if (!list.length) return null;
   // Prefer a read that produced page-level coordinates on the original page/crop.
   const chosen = list.find(b => b.locationQuality === 'decoded-symbol-bounding-box') || list[0];
-  const box = expandBox(chosen.pageBoundingBox, kind === FORMAT_KIND.datamatrix || kind === FORMAT_KIND.qr ? 0.30 : 0.18, canvas.width, canvas.height, kind === FORMAT_KIND.datamatrix || kind === FORMAT_KIND.qr ? 28 : 36);
+  const box = expandBox(chosen.pageBoundingBox, canvas.width, canvas.height, BARCODE_BOX_MARGIN_PX);
   if (!box) return null;
   return {
     canvas: cropCanvas(canvas, box.x, box.y, box.width, box.height),
@@ -674,16 +704,23 @@ function isStarTrackFreightItemValue(value) {
   return /^[A-Z0-9]{4}\d{8}[A-Z0-9]{3}\d{5}$/.test(v) || /^00\d{18}$/.test(v);
 }
 
-function isStarTrackRoutingValue(value) {
+function isStarTrackAtlValue(value) {
   const v = normalizeBarcodeValueForRole(value);
-  return /^[A-Z0-9]{3}\d{4}[A-Z0-9]{3}$/.test(v) || /^421036\d{4}403[A-Z0-9]{3}$/.test(v);
+  return /^C\d{9}$/.test(v);
 }
 
-function cropForDecodedBarcodeMatch(canvas, barcodes, predicate, expansion = 0.18, minPad = 36) {
+function isStarTrackRoutingValue(value) {
+  const v = normalizeBarcodeValueForRole(value);
+  const route = v.match(/^([A-Z0-9]{3})\d{4}[A-Z0-9]{2,3}$/);
+  const gs1Route = v.match(/^421036\d{4}403([A-Z0-9]{3})$/);
+  return Boolean((route && STARTRACK_LABEL_CODE_MAP[route[1]]) || (gs1Route && STARTRACK_LABEL_CODE_MAP[gs1Route[1]]));
+}
+
+function cropForDecodedBarcodeMatch(canvas, barcodes, predicate, marginPx = BARCODE_BOX_MARGIN_PX) {
   const list = (barcodes || []).filter(b => b.pageBoundingBox && predicate(b));
   if (!list.length) return null;
   const chosen = list.find(b => b.locationQuality === 'decoded-symbol-bounding-box') || list[0];
-  const box = expandBox(chosen.pageBoundingBox, expansion, canvas.width, canvas.height, minPad);
+  const box = expandBox(chosen.pageBoundingBox, canvas.width, canvas.height, marginPx);
   if (!box) return null;
   return {
     canvas: cropCanvas(canvas, box.x, box.y, box.width, box.height),
@@ -701,16 +738,17 @@ function createLabelImages(canvas, detectedBarcodes = []) {
   const starTrackRoutingLocated = cropForDecodedBarcodeMatch(
     canvas,
     detectedBarcodes,
-    b => isLinearBarcode(b) && !isQrBarcode(b) && !isDataMatrixBarcode(b) && isStarTrackRoutingValue(b.rawValue),
-    0.20,
-    34
+    b => isLinearBarcode(b) && !isQrBarcode(b) && !isDataMatrixBarcode(b) && isStarTrackRoutingValue(b.rawValue)
+  );
+  const starTrackAtlLocated = cropForDecodedBarcodeMatch(
+    canvas,
+    detectedBarcodes,
+    b => isLinearBarcode(b) && !isQrBarcode(b) && !isDataMatrixBarcode(b) && isStarTrackAtlValue(b.rawValue)
   );
   const starTrackFreightLocated = cropForDecodedBarcodeMatch(
     canvas,
     detectedBarcodes,
-    b => isLinearBarcode(b) && !isQrBarcode(b) && !isDataMatrixBarcode(b) && isStarTrackFreightItemValue(b.rawValue),
-    0.18,
-    36
+    b => isLinearBarcode(b) && !isQrBarcode(b) && !isDataMatrixBarcode(b) && isStarTrackFreightItemValue(b.rawValue)
   );
 
   // Fixed heuristic crops are kept only as fallback images when no decodable symbol
@@ -721,6 +759,7 @@ function createLabelImages(canvas, detectedBarcodes = []) {
   const linearCrop = cropCanvas(canvas, w * 0.04, h * 0.42, w * 0.92, h * 0.30);
   const rightLinearCrop = cropCanvas(canvas, w * 0.68, h * 0.18, w * 0.31, h * 0.68);
   const starTrackRoutingCrop = cropCanvas(canvas, w * 0.04, h * 0.23, w * 0.62, h * 0.22);
+  const starTrackAtlCrop = cropCanvas(canvas, w * 0.54, h * 0.02, w * 0.44, h * 0.18);
   const starTrackFreightCrop = cropCanvas(canvas, w * 0.04, h * 0.50, w * 0.92, h * 0.20);
 
   return {
@@ -740,6 +779,9 @@ function createLabelImages(canvas, detectedBarcodes = []) {
     routingBarcodeCrop: canvasToDataUrl(starTrackRoutingLocated?.canvas || starTrackRoutingCrop, 620),
     routingBarcodeBox: starTrackRoutingLocated?.box || null,
     routingBarcodeBoxSource: starTrackRoutingLocated?.barcode ? `${starTrackRoutingLocated.barcode.source || 'scanner'} · ${starTrackRoutingLocated.barcode.regionLabel || ''} · ${starTrackRoutingLocated.barcode.variantLabel || ''}` : 'fallback heuristic crop only',
+    atlBarcodeCrop: canvasToDataUrl(starTrackAtlLocated?.canvas || starTrackAtlCrop, 620),
+    atlBarcodeBox: starTrackAtlLocated?.box || null,
+    atlBarcodeBoxSource: starTrackAtlLocated?.barcode ? `${starTrackAtlLocated.barcode.source || 'scanner'} Â· ${starTrackAtlLocated.barcode.regionLabel || ''} Â· ${starTrackAtlLocated.barcode.variantLabel || ''}` : 'fallback heuristic crop only',
     freightBarcodeCrop: canvasToDataUrl(starTrackFreightLocated?.canvas || starTrackFreightCrop, 780),
     freightBarcodeBox: starTrackFreightLocated?.box || null,
     freightBarcodeBoxSource: starTrackFreightLocated?.barcode ? `${starTrackFreightLocated.barcode.source || 'scanner'} · ${starTrackFreightLocated.barcode.regionLabel || ''} · ${starTrackFreightLocated.barcode.variantLabel || ''}` : 'fallback heuristic crop only'
@@ -786,7 +828,7 @@ const STANDARD_EXAMPLES = {
   ST_WEIGHT_PRESENT: 'Weight should be displayed in kg in the item details area.',
   ST_QR_PRESENT: 'StarTrack 2D QR barcode must appear on all labels. It uses fixed-width fields and error correction level L.',
   ST_FREIGHT_BARCODE_PRESENT: 'Freight item barcode is mandatory: either StarTrack 20-character Code128 XXXZ99999999AAA99999 or GS1 AI 00 SSCC.',
-  ST_ROUTING_BARCODE_PRESENT: 'Routing barcode is mandatory: StarTrack SSS9999DDD or GS1 421/403 routing barcode for AU domestic SSCC labels.',
+  ST_ROUTING_BARCODE_PRESENT: 'Routing barcode is mandatory: StarTrack SSS9999DD/DDD or GS1 421/403 routing barcode for AU domestic SSCC labels.',
   ST_PRODUCT_KNOWN: 'Known StarTrack product codes include EXP, PRM, FPP, ARL, FPA, RET, RE2, APT and TSE.',
   ST_CONNOTE_STRUCTURE: 'StarTrack connote number format is four-character Despatch ID plus eight-digit incrementing number.',
   ST_ITEM_SEQUENCE: 'StarTrack freight item barcode ends with a five-digit item number.',
@@ -803,6 +845,7 @@ const STANDARD_EXAMPLES = {
   ST_QR_UNIT: 'Unit type must be permitted for the StarTrack product; examples include CTN, BAG, ITM, PAL, SAT and SKI.',
   ST_QR_ATL: 'ATL number format is C999999999 when Authority To Leave is selected.',
   ST_ATL_BARCODE: 'Optional StarTrack ATL barcode format is C999999999.',
+  ST_ATL_COUNTER: 'ATL sequential counter starts at 000000001 and increments per consignment requiring Authority To Leave.',
   ST_SSCC_PRODUCT_RULE: 'For StarTrack SSCC, product is not encoded in the SSCC article identifier; use QR/routing/manifest context for product where available.',
 };
 
@@ -1006,6 +1049,10 @@ function starTrackRoutingBarcodeList(audit) {
   return decodedBarcodeList(audit, 'linear').filter(b => isStarTrackRoutingValue(b.rawValue));
 }
 
+function starTrackAtlBarcodeList(audit) {
+  return decodedBarcodeList(audit, 'linear').filter(b => isStarTrackAtlValue(b.rawValue));
+}
+
 function starTrackFreightBarcodeList(audit) {
   return decodedBarcodeList(audit, 'linear').filter(b => isStarTrackFreightItemValue(b.rawValue));
 }
@@ -1055,25 +1102,29 @@ function buildStarTrackReportHtml(audit) {
   const grouped = groupValidations(audit.validations || []);
   const qrItems = grouped['StarTrack QR barcode'] || [];
   const routingItems = grouped['StarTrack routing barcode'] || [];
+  const atlItems = grouped['StarTrack ATL barcode'] || [];
   const freightItems = grouped['StarTrack freight item barcode'] || [];
   const serviceItems = grouped['StarTrack product/article data'] || [];
   const labelItems = grouped['label-layout'] || [];
   const textItems = grouped['address-format'] || [];
-  const used = new Set(['StarTrack QR barcode', 'StarTrack routing barcode', 'StarTrack freight item barcode', 'StarTrack product/article data', 'label-layout', 'address-format']);
+  const used = new Set(['StarTrack QR barcode', 'StarTrack routing barcode', 'StarTrack ATL barcode', 'StarTrack freight item barcode', 'StarTrack product/article data', 'label-layout', 'address-format']);
   const otherItems = Object.entries(grouped).filter(([key]) => !used.has(key)).flatMap(([, items]) => items);
   const reviewItems = (audit.validations || []).filter(v => v.status === 'manual_review' || v.status === 'warning' || v.status === 'fail');
   const h = auditDisplayHeader(audit, 0);
   const qrBarcodes = decodedBarcodeList(audit, 'qr');
   const routingBarcodes = starTrackRoutingBarcodeList(audit);
+  const atlBarcodes = starTrackAtlBarcodeList(audit);
   const freightBarcodes = starTrackFreightBarcodeList(audit);
   const qrParses = audit?.startrack?.qrParses || [];
   const freightParses = audit?.startrack?.freightParses || [];
   const routingParses = audit?.startrack?.routingParses || [];
+  const atlParses = audit?.startrack?.atlParses || [];
   const ssccs = audit?.startrack?.ssccParses || [];
   const navLinks = [
     ['full-label-image', 'Full label image'],
     ['datamatrix-section', 'StarTrack QR barcode'],
     ['routing-section', 'Routing barcode'],
+    ['atl-section', 'ATL barcode'],
     ['freight-section', 'Freight item barcode'],
     ['service-article-section', 'Product and article data'],
     ['text-content-section', 'Visible label text']
@@ -1501,17 +1552,22 @@ function buildConsolidatedReportHtml(audits = []) {
     const grouped = groupValidations(audit.validations || []);
     const dataMatrixItems = audit.carrier === 'startrack' ? (grouped['StarTrack QR barcode'] || []) : (grouped['DataMatrix barcode analysis'] || []);
     const routingItems = grouped['StarTrack routing barcode'] || [];
+    const atlItems = grouped['StarTrack ATL barcode'] || [];
     const freightItems = grouped['StarTrack freight item barcode'] || [];
     const linearItems = grouped['linear barcode analysis'] || [];
     const serviceItems = audit.carrier === 'startrack' ? (grouped['StarTrack product/article data'] || []) : ([...(grouped['service-code'] || []), ...(grouped['sscc'] || [])]);
     const labelItems = grouped['label-layout'] || [];
     const textItems = grouped['address-format'] || [];
+    const usedSectionKeys = audit.carrier === 'startrack'
+      ? ['StarTrack QR barcode','StarTrack routing barcode','StarTrack ATL barcode','StarTrack freight item barcode','StarTrack product/article data','label-layout','address-format']
+      : ['DataMatrix barcode analysis','linear barcode analysis','service-code','sscc','label-layout','address-format'];
     const otherItems = Object.entries(grouped)
-      .filter(([key]) => !['DataMatrix barcode analysis','linear barcode analysis','service-code','sscc','label-layout','address-format'].includes(key))
+      .filter(([key]) => !usedSectionKeys.includes(key))
       .flatMap(([, items]) => items);
     const dmBarcodes = decodedBarcodeList(audit, audit.carrier === 'startrack' ? 'qr' : 'datamatrix');
     const linearBarcodes = decodedBarcodeList(audit, 'linear');
     const routingBarcodes = starTrackRoutingBarcodeList(audit);
+    const atlBarcodes = starTrackAtlBarcodeList(audit);
     const freightBarcodes = starTrackFreightBarcodeList(audit);
     const serviceRows = serviceMatrixRowsHtml(audit, esc);
     const ssccOnly = auditHasSsccOnly(audit);
@@ -1521,6 +1577,7 @@ function buildConsolidatedReportHtml(audits = []) {
     const barcodeSections = audit.carrier === 'startrack'
       ? `<h3>StarTrack 2D QR barcode</h3>${audit.labelImages?.qrBarcodeCrop ? `<figure class="crop"><img src="${audit.labelImages.qrBarcodeCrop}" alt="StarTrack QR crop"><figcaption>${esc(imageBoxCaption(audit.labelImages, FORMAT_KIND.qr))}</figcaption></figure>` : ''}<ul>${rawBarcodeListHtml(dmBarcodes, esc) || '<li>No StarTrack QR string decoded from this file.</li>'}</ul>${renderReportValidationTable(dataMatrixItems, esc)}
       <h3>StarTrack routing barcode</h3>${audit.labelImages?.routingBarcodeCrop ? `<figure class="crop"><img src="${audit.labelImages.routingBarcodeCrop}" alt="StarTrack routing crop"><figcaption>${esc(imageBoxCaption(audit.labelImages, 'startrack-routing'))}</figcaption></figure>` : ''}<ul>${rawBarcodeListHtml(routingBarcodes, esc) || '<li>No StarTrack routing barcode string decoded from this file.</li>'}</ul>${renderReportValidationTable(routingItems, esc)}
+      <h3>StarTrack ATL barcode</h3>${audit.labelImages?.atlBarcodeCrop ? `<figure class="crop"><img src="${audit.labelImages.atlBarcodeCrop}" alt="StarTrack ATL crop"><figcaption>${esc(imageBoxCaption(audit.labelImages, 'startrack-atl'))}</figcaption></figure>` : ''}<ul>${rawBarcodeListHtml(atlBarcodes, esc) || '<li>No StarTrack ATL barcode string decoded from this file.</li>'}</ul>${renderReportValidationTable(atlItems, esc)}
       <h3>StarTrack freight item barcode</h3>${audit.labelImages?.freightBarcodeCrop ? `<figure class="crop"><img src="${audit.labelImages.freightBarcodeCrop}" alt="StarTrack freight item crop"><figcaption>${esc(imageBoxCaption(audit.labelImages, 'startrack-freight'))}</figcaption></figure>` : ''}<ul>${rawBarcodeListHtml(freightBarcodes, esc) || '<li>No StarTrack freight item / SSCC barcode string decoded from this file.</li>'}</ul>${renderReportValidationTable(freightItems, esc)}`
       : `<h3>GS1 DataMatrix barcode</h3>${audit.labelImages?.dataMatrixFocusedCrop || audit.labelImages?.dataMatrixCrop ? `<figure class="crop"><img src="${audit.labelImages.dataMatrixFocusedCrop || audit.labelImages.dataMatrixCrop}" alt="GS1 DataMatrix crop"><figcaption>${esc(imageBoxCaption(audit.labelImages, FORMAT_KIND.datamatrix))}</figcaption></figure>` : ''}<ul>${rawBarcodeListHtml(dmBarcodes, esc) || '<li>No GS1 DataMatrix string decoded from this file.</li>'}</ul>${renderReportValidationTable(dataMatrixItems, esc)}
       <h3>GS1-128 linear barcode</h3>${audit.labelImages?.linearBarcodeCrop || audit.labelImages?.rightLinearBarcodeCrop ? `<figure class="crop"><img src="${audit.labelImages.linearBarcodeCrop || audit.labelImages.rightLinearBarcodeCrop}" alt="GS1-128 crop"><figcaption>${esc(imageBoxCaption(audit.labelImages, FORMAT_KIND.linear))}</figcaption></figure>` : ''}<ul>${rawBarcodeListHtml(linearBarcodes, esc) || '<li>No GS1-128 linear barcode string decoded from this file.</li>'}</ul>${renderReportValidationTable(linearItems, esc)}`;
@@ -1685,13 +1742,14 @@ function sectionItems(audit, displayCategory) {
 function getAuditSections(audit) {
   const grouped = audit ? groupValidations(audit.validations || []) : {};
   if (audit?.carrier === 'startrack') {
-    const used = new Set(['StarTrack QR barcode', 'StarTrack routing barcode', 'StarTrack freight item barcode', 'StarTrack product/article data', 'label-layout', 'address-format']);
+    const used = new Set(['StarTrack QR barcode', 'StarTrack routing barcode', 'StarTrack ATL barcode', 'StarTrack freight item barcode', 'StarTrack product/article data', 'label-layout', 'address-format']);
     return {
       label: grouped['label-layout'] || [],
       datamatrix: grouped['StarTrack QR barcode'] || [],
       routing: grouped['StarTrack routing barcode'] || [],
+      atl: grouped['StarTrack ATL barcode'] || [],
       freight: grouped['StarTrack freight item barcode'] || [],
-      linear: [...(grouped['StarTrack routing barcode'] || []), ...(grouped['StarTrack freight item barcode'] || [])],
+      linear: [...(grouped['StarTrack routing barcode'] || []), ...(grouped['StarTrack ATL barcode'] || []), ...(grouped['StarTrack freight item barcode'] || [])],
       service: grouped['StarTrack product/article data'] || [],
       text: grouped['address-format'] || [],
       other: Object.entries(grouped).filter(([key]) => !used.has(key)).flatMap(([, items]) => items)
@@ -1847,6 +1905,7 @@ function AuditBookmarks({ audit, sections }) {
     ['full-label-image', 'Full label image', sections.label],
     ['datamatrix-section', 'StarTrack QR', sections.datamatrix],
     ['routing-section', 'Routing barcode', sections.routing],
+    ['atl-section', 'ATL barcode', sections.atl],
     ['freight-section', 'Freight item barcode', sections.freight],
     ['service-article-section', 'Product and article data', sections.service],
     ['text-content-section', 'Visible label text', [...sections.text, ...sections.other]]
@@ -1941,7 +2000,30 @@ function StarTrackRoutingSection({ audit, items, scanData }) {
           <h3>Decoded routing barcode values</h3>
           {routingBarcodes.length ? <ul className="barcode-list">{routingBarcodes.map((b, idx) => <li key={idx}><strong>Routing barcode</strong>: <code>{b.rawValue}</code><br/><span className="muted small">{b.pageBoundingBox ? 'Barcode location verified on this label.' : 'Barcode decoded; exact location not mapped.'}</span></li>)}</ul> : <p className="muted">No StarTrack routing barcode value decoded.</p>}
           {routes.length > 0 && <div className="fact-cards fact-cards-wide">{routes.map((route, idx) => <React.Fragment key={idx}><div><span>Label code</span><strong>{route.labelCode}</strong></div><div><span>Postcode</span><strong>{route.postcode}</strong></div><div><span>Depot / port</span><strong>{route.depotOrPort || 'Not applicable'}</strong></div><div><span>Format</span><strong>{route.formatDescription}</strong></div></React.Fragment>)}</div>}
-          <StandardLine>StarTrack routing barcode is required separately from the freight item barcode. Standard format is SSS9999DDD, such as EXP2190MRP. AU domestic SSCC labels may use GS1 421/403 routing.</StandardLine>
+          <StandardLine>StarTrack routing barcode is required separately from the freight item and ATL barcodes. Standard format is SSS9999DD/DDD: Premium and Fixed Price Premium labels commonly use a three-character depot/port suffix, while Express labels may use a two-character suffix. AU domestic SSCC labels may use GS1 421/403 routing.</StandardLine>
+          <ValidationTable items={items} />
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function StarTrackAtlSection({ audit, items, scanData }) {
+  const images = audit?.labelImages || {};
+  const atlBarcodes = starTrackAtlBarcodeList(audit);
+  const atlParses = audit?.startrack?.atlParses || [];
+  return (
+    <section className="card audit-section startrack-section" id="atl-section">
+      <div className="section-heading"><SectionTitle id="atl-section-title">StarTrack ATL Barcode</SectionTitle><SectionStatus items={items} /></div>
+      <div className="two-col">
+        <div>
+          {images.atlBarcodeCrop ? <figure className="category-crop wide"><img src={images.atlBarcodeCrop} alt="StarTrack ATL barcode crop" /><figcaption>{imageBoxCaption(images, 'startrack-atl')}</figcaption></figure> : <p className="muted">No ATL barcode crop captured.</p>}
+        </div>
+        <div>
+          <h3>Decoded ATL barcode values</h3>
+          {atlBarcodes.length ? <ul className="barcode-list">{atlBarcodes.map((b, idx) => <li key={idx}><strong>ATL barcode</strong>: <code>{b.rawValue}</code><br/><span className="muted small">{b.pageBoundingBox ? 'Barcode location verified on this label.' : 'Barcode decoded; exact location not mapped.'}</span></li>)}</ul> : <p className="muted">No StarTrack ATL barcode value decoded.</p>}
+          {atlParses.length > 0 && <div className="fact-cards fact-cards-wide">{atlParses.map((atl, idx) => <React.Fragment key={idx}><div><span>ATL number</span><strong>{atl.atlNumber}</strong></div><div><span>Counter</span><strong>{atl.counter}</strong></div><div><span>Format</span><strong>C999999999</strong></div><div><span>Orientation</span><strong>Picket Fence</strong></div></React.Fragment>)}</div>}
+          <StandardLine>StarTrack ATL barcode content is C999999999. C is always the character C and the nine-digit sequential counter starts at 000000001. Preferred orientation is Picket Fence, minimum bar height 10mm, minimum barcode length 28mm, left/right quiet zone 5mm, and resolution 6 dots per mm.</StandardLine>
           <ValidationTable items={items} />
         </div>
       </div>
@@ -2156,21 +2238,26 @@ function TextContentSection({ audit, items, otherItems }) {
 
 
 function App() {
-  const [eparcelFiles, setEparcelFiles] = useState([]);
-  const [startrackFiles, setStartrackFiles] = useState([]);
+  // Optional Get Shipments payload pasted by the user; applied during audit or refreshed later.
   const [manifestJson, setManifestJson] = useState('');
+  // True while PDF/image rendering, barcode scanning, and validation are running.
   const [processing, setProcessing] = useState(false);
+  // User-visible progress state for the current batch scan.
   const [scanProgress, setScanProgress] = useState({ percent: 0, phase: 'Idle' });
+  // Status/error text shown outside the progress panel.
   const [message, setMessage] = useState('');
+  // Raw rendered label data retained so payload comparison can be re-run without rescanning files.
   const [scanDatas, setScanDatas] = useState([]);
+  // Completed audit objects rendered by the report UI.
   const [audits, setAudits] = useState([]);
+  // Index of the audit currently selected in the tabbed report view.
   const [activeIndex, setActiveIndex] = useState(0);
 
   const activeAudit = audits[activeIndex] || null;
   const activeScanData = scanDatas[activeIndex] || null;
   const batchSummary = useMemo(() => combinedAuditSummary(audits), [audits]);
-  const totalSelectedFiles = eparcelFiles.length + startrackFiles.length;
 
+  /** Filters a FileList down to the PDF/image formats supported by the audit pipeline. */
   function normaliseSelectedFiles(selectedFiles) {
     return Array.from(selectedFiles || []).filter(file => {
       const name = String(file.name || '').toLowerCase();
@@ -2179,16 +2266,17 @@ function App() {
     });
   }
 
-  function acceptSelectedFiles(selectedFiles, labelFamily = 'eparcel') {
+  /** Starts the full audit flow as soon as files are dropped or chosen. */
+  async function acceptSelectedFiles(selectedFiles, labelFamily = 'eparcel') {
     const selected = normaliseSelectedFiles(selectedFiles);
-    if (labelFamily === 'startrack') setStartrackFiles(selected);
-    else setEparcelFiles(selected);
-    setAudits([]);
-    setScanDatas([]);
-    setActiveIndex(0);
-    setMessage(selected.length ? `${selected.length} ${labelFamily === 'startrack' ? 'StarTrack' : 'eParcel'} file(s) ready for verification.` : 'No supported PDF or image files were selected.');
+    if (!selected.length) {
+      setMessage('No supported PDF or image files were selected.');
+      return;
+    }
+    await auditSelectedFiles(selected, labelFamily);
   }
 
+  /** Moves the progress bar forward without allowing it to move backwards. */
   function updateScanProgress(percent, phase) {
     setScanProgress(prev => ({
       percent: Math.max(prev.percent || 0, Math.min(100, Math.round(percent))),
@@ -2196,13 +2284,11 @@ function App() {
     }));
   }
 
-  async function handleFileAudit() {
-    const batches = [
-      ...eparcelFiles.map(file => ({ file, labelFamily: 'eparcel' })),
-      ...startrackFiles.map(file => ({ file, labelFamily: 'startrack' }))
-    ];
+  /** Renders, scans, audits, and displays all labels in the selected carrier upload batch. */
+  async function auditSelectedFiles(files, labelFamily = 'eparcel') {
+    const batches = files.map(file => ({ file, labelFamily }));
     if (!batches.length) {
-      setMessage('Choose or drop one or more eParcel or StarTrack PDF/image label files first.');
+      setMessage('Choose or drop one or more PDF/image label files first.');
       return;
     }
     setProcessing(true);
@@ -2224,8 +2310,9 @@ function App() {
         const { file: currentFile, labelFamily } = batches[i];
         const fileStartPercent = 12 + (i / Math.max(1, batches.length)) * 72;
         const fileEndPercent = 12 + ((i + 1) / Math.max(1, batches.length)) * 72;
-        updateScanProgress(fileStartPercent, `${labelFamily === 'startrack' ? 'StarTrack' : 'eParcel'} file ${i + 1} of ${batches.length}`);
-        setMessage(`Scanning ${labelFamily === 'startrack' ? 'StarTrack' : 'eParcel'} file ${i + 1} of ${batches.length}: ${currentFile.name}`);
+        const carrierLabel = labelFamilyName(labelFamily);
+        updateScanProgress(fileStartPercent, `${carrierLabel} file ${i + 1} of ${batches.length}`);
+        setMessage(`Scanning ${carrierLabel} file ${i + 1} of ${batches.length}: ${currentFile.name}`);
         const dataItems = currentFile.type === 'application/pdf' || currentFile.name.toLowerCase().endsWith('.pdf')
           ? await processPdfLabels(currentFile, detector)
           : [await processImage(currentFile, detector)];
@@ -2259,6 +2346,7 @@ function App() {
       const totalDecoded = nextAudits.reduce((sum, audit) => sum + (audit.detectedBarcodes?.length || 0), 0);
       setScanProgress({ percent: 100, phase: 'Complete' });
       setMessage(`Audit complete. ${nextAudits.length} label(s) processed with ${totalDecoded} decoded barcode string(s).`);
+      setTimeout(() => document.getElementById('audit-result')?.scrollIntoView({ block: 'start' }), 0);
     } catch (error) {
       console.error(error);
       setScanProgress({ percent: 100, phase: 'Stopped' });
@@ -2268,6 +2356,7 @@ function App() {
     }
   }
 
+  /** Re-applies the current Get Shipments payload to already-scanned labels. */
   function rerunAuditWithPayload() {
     if (!scanDatas.length) {
       setMessage('No scanned file data is available yet. Upload and audit one or more labels first.');
@@ -2289,7 +2378,7 @@ function App() {
     <main className="app">
       {/* Local security mode: bind only to 127.0.0.1, run as a normal user, and avoid admin rights, Docker, WSL, registry changes, Windows services, or privileged ports. */}
       <header className="hero hero-compact">
-        <div className="ap-mark">▌</div>
+        <img className="ap-mark" src={australiaPostLogoUrl} alt="Australia Post" />
         <div>
           <h1>{APP_TITLE}</h1>
           <p>Audit Australia Post eParcel and StarTrack digital labels from PDF or image files, including barcode reads, article details, SSCC handling and visible label content.</p>
@@ -2310,11 +2399,10 @@ function App() {
             onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; }}
             onDrop={e => { e.preventDefault(); if (!processing) acceptSelectedFiles(e.dataTransfer.files, 'eparcel'); }}
           >
-            <input className="file-input-hidden" type="file" multiple accept="application/pdf,image/png,image/jpeg,image/webp,image/bmp" disabled={processing} onChange={e => acceptSelectedFiles(e.target.files, 'eparcel')} />
+            <input className="file-input-hidden" type="file" multiple accept={ACCEPTED_LABEL_FILE_TYPES} disabled={processing} onChange={e => { acceptSelectedFiles(e.target.files, 'eparcel'); e.target.value = ''; }} />
             <span className="dropzone-title">Drop eParcel Parcel Post / Express Post labels here</span>
             <span className="dropzone-subtitle">PDF, PNG, JPG, WebP or BMP</span>
           </label>
-          {eparcelFiles.length > 0 && <div className="file-list"><strong>{eparcelFiles.length} eParcel file(s) selected</strong><ol>{eparcelFiles.map((f, idx) => <li key={`ep-${f.name}-${idx}`}>{f.name} <span className="muted">({Math.round(f.size / 1024)} KB)</span></li>)}</ol></div>}
         </div>
         <div>
           <h2>StarTrack upload</h2>
@@ -2323,22 +2411,14 @@ function App() {
             onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; }}
             onDrop={e => { e.preventDefault(); if (!processing) acceptSelectedFiles(e.dataTransfer.files, 'startrack'); }}
           >
-            <input className="file-input-hidden" type="file" multiple accept="application/pdf,image/png,image/jpeg,image/webp,image/bmp" disabled={processing} onChange={e => acceptSelectedFiles(e.target.files, 'startrack')} />
+            <input className="file-input-hidden" type="file" multiple accept={ACCEPTED_LABEL_FILE_TYPES} disabled={processing} onChange={e => { acceptSelectedFiles(e.target.files, 'startrack'); e.target.value = ''; }} />
             <span className="dropzone-title">Drop StarTrack labels here</span>
             <span className="dropzone-subtitle">Light blue StarTrack audit path with QR, routing, freight item and SSCC checks</span>
           </label>
-          {startrackFiles.length > 0 && <div className="file-list"><strong>{startrackFiles.length} StarTrack file(s) selected</strong><ol>{startrackFiles.map((f, idx) => <li key={`st-${f.name}-${idx}`}>{f.name} <span className="muted">({Math.round(f.size / 1024)} KB)</span></li>)}</ol></div>}
         </div>
-        <div className="upload-actions">
-          <button className="primary" disabled={!totalSelectedFiles || processing} onClick={handleFileAudit}>
-            {processing ? 'Processing...' : totalSelectedFiles > 1 ? 'Verify selected labels' : 'Verify selected label'}
-          </button>
-          <p className="muted small">Each PDF page or image is verified as an individual label. Use the eParcel box for Parcel Post/Express Post labels and the StarTrack box for StarTrack labels.</p>
-        </div>
-
-        <div className="payload-input-panel">
-          <h2>Get Shipments API payload comparison</h2>
-          <p className="muted small">Optional: paste a short Get Shipments response or relevant JSON/plain-text payload from the Shipping and Tracking API. When supplied, audit tables add a final column comparing the scanned label data with the payload values, such as lodgement/sender address, article or freight item IDs, connote/consignment numbers, product/service codes, delivery flags and weight.</p>
+        <details className="payload-input-panel">
+          <summary>Get Shipments API payload comparison</summary>
+          <p className="muted small">Optional: paste a Get Shipments response before upload, or apply it to the current report.</p>
           <textarea
             className="api-payload-textarea"
             rows="8"
@@ -2356,7 +2436,7 @@ function App() {
             onChange={e => setManifestJson(e.target.value)}
           />
           {scanDatas.length > 0 && <button className="secondary" onClick={rerunAuditWithPayload}>Apply payload comparison to current results</button>}
-        </div>
+        </details>
       </section>
 
       {processing && (
@@ -2442,6 +2522,7 @@ function App() {
                   <>
                     <StarTrackQrSection audit={activeAudit} items={sections.datamatrix} scanData={activeScanData || activeAudit} />
                     <StarTrackRoutingSection audit={activeAudit} items={sections.routing} scanData={activeScanData || activeAudit} />
+                    <StarTrackAtlSection audit={activeAudit} items={sections.atl} scanData={activeScanData || activeAudit} />
                     <StarTrackFreightItemSection audit={activeAudit} items={sections.freight} scanData={activeScanData || activeAudit} />
                   </>
                 ) : (
