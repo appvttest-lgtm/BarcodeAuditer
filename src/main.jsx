@@ -494,23 +494,20 @@ function shouldStopTargetScan(target, found) {
   return found.length >= 2;
 }
 
-function bestGridCrop(canvas, cellsX = 6, cellsY = 5, windowScale = 1.4) {
-  let best = null;
-  const minCell = 42;
-  for (let gy = 0; gy < cellsY; gy += 1) {
-    for (let gx = 0; gx < cellsX; gx += 1) {
-      const cw = Math.max(minCell, Math.floor(canvas.width / cellsX * windowScale));
-      const ch = Math.max(minCell, Math.floor(canvas.height / cellsY * windowScale));
-      const x = Math.max(0, Math.min(canvas.width - cw, Math.floor((canvas.width - cw) * (gx / Math.max(1, cellsX - 1)))));
-      const y = Math.max(0, Math.min(canvas.height - ch, Math.floor((canvas.height - ch) * (gy / Math.max(1, cellsY - 1)))));
-      const crop = cropCanvas(canvas, x, y, cw, ch);
-      const stats = imageStats(crop, `grid ${gx},${gy}`);
-      const squarePenalty = Math.abs(cw - ch) / Math.max(cw, ch);
-      const score = (stats.blackRatio * 1.5) + (stats.transitionRate * 4.0) - squarePenalty * 0.15;
-      if (!best || score > best.score) best = { x, y, width: cw, height: ch, score, crop, stats };
-    }
-  }
-  return best;
+function shortenBarcodeValue(value, maxLength = 42) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function detectorResultSummary(decoded) {
+  if (!decoded.length) return 'no detector results';
+  return decoded.map(barcode => {
+    const source = barcode.source || 'Unknown detector';
+    const format = barcode.format || barcode.symbology || 'unknown format';
+    const variant = barcode.variantLabel ? ` via ${barcode.variantLabel}` : '';
+    return `${source} (${format}${variant}) "${shortenBarcodeValue(barcode.rawValue)}"`;
+  }).join('; ');
 }
 
 function makeTarget(sourceCanvas, kind, label, x, y, w, h, formats) {
@@ -520,26 +517,39 @@ function makeTarget(sourceCanvas, kind, label, x, y, w, h, formats) {
   return { kind, label, x, y, w, h, canvas: targetCanvas, formats };
 }
 
-function buildCategorizedScanTargets(canvas) {
+function hasBarcodeKind(barcodes, kind) {
+  return (barcodes || []).some(barcode => (
+    kind === FORMAT_KIND.qr ? isQrBarcode(barcode)
+      : kind === FORMAT_KIND.datamatrix ? isDataMatrixBarcode(barcode)
+        : kind === FORMAT_KIND.linear ? isLinearBarcode(barcode) && !isDataMatrixBarcode(barcode) && !isQrBarcode(barcode)
+          : false
+  ));
+}
+
+function shouldSkipFullPageSafetyScan(found, labelFamily = 'eparcel') {
+  const unique = dedupeBarcodes(found);
+  if (labelFamily === 'startrack') {
+    return unique.length >= 3 && hasBarcodeKind(unique, FORMAT_KIND.qr);
+  }
+  return unique.length >= 2;
+}
+
+function buildCategorizedScanTargets(canvas, labelFamily = 'eparcel') {
   const w = canvas.width;
   const h = canvas.height;
-  const dmBroadRect = { x: w * 0.52, y: h * 0.01, w: w * 0.47, h: h * 0.34 };
-  const dmBroad = cropCanvas(canvas, dmBroadRect.x, dmBroadRect.y, dmBroadRect.w, dmBroadRect.h);
-  const dmGrid = bestGridCrop(dmBroad, 6, 5, 1.35);
-  const targets = [
-    makeTarget(canvas, FORMAT_KIND.datamatrix, 'DataMatrix top-right broad crop', dmBroadRect.x, dmBroadRect.y, dmBroadRect.w, dmBroadRect.h, ['DataMatrix']),
-    makeTarget(canvas, FORMAT_KIND.datamatrix, 'DataMatrix expected crop', w * 0.70, h * 0.055, w * 0.29, h * 0.24, ['DataMatrix']),
-    ...(dmGrid ? [makeTarget(canvas, FORMAT_KIND.datamatrix, `DataMatrix high-density window (${dmGrid.stats.label})`, dmBroadRect.x + dmGrid.x, dmBroadRect.y + dmGrid.y, dmGrid.width, dmGrid.height, ['DataMatrix'])] : []),
-    makeTarget(canvas, FORMAT_KIND.qr, 'QR barcode upper/middle scan', w * 0.35, h * 0.10, w * 0.60, h * 0.55, ['QRCode']),
-    makeTarget(canvas, FORMAT_KIND.qr, 'QR barcode full label scan', 0, 0, w, h, ['QRCode']),
-    makeTarget(canvas, FORMAT_KIND.linear, 'StarTrack routing barcode expected crop', w * 0.04, h * 0.23, w * 0.62, h * 0.22, ['Code128']),
-    makeTarget(canvas, FORMAT_KIND.linear, 'StarTrack freight item barcode expected crop', w * 0.04, h * 0.50, w * 0.92, h * 0.20, ['Code128']),
-    makeTarget(canvas, FORMAT_KIND.linear, 'Linear barcode lower horizontal crop', w * 0.03, h * 0.43, w * 0.94, h * 0.32, ['Code128']),
-    makeTarget(canvas, FORMAT_KIND.linear, 'Linear barcode lower tight crop', w * 0.05, h * 0.56, w * 0.90, h * 0.18, ['Code128']),
-    makeTarget(canvas, FORMAT_KIND.linear, 'Linear barcode right vertical crop', w * 0.66, h * 0.14, w * 0.33, h * 0.74, ['Code128']),
-    makeTarget(canvas, FORMAT_KIND.mixed, 'Full page safety scan', 0, 0, w, h, ['Code128', 'DataMatrix', 'QRCode'])
+  if (labelFamily === 'startrack') {
+    return [
+      makeTarget(canvas, FORMAT_KIND.qr, 'StarTrack QR full label scan', 0, 0, w, h, ['QRCode']),
+      makeTarget(canvas, FORMAT_KIND.linear, 'StarTrack routing barcode expected crop', w * 0.04, h * 0.23, w * 0.62, h * 0.22, ['Code128']),
+      makeTarget(canvas, FORMAT_KIND.linear, 'StarTrack freight item barcode expected crop', w * 0.04, h * 0.50, w * 0.92, h * 0.20, ['Code128']),
+      makeTarget(canvas, FORMAT_KIND.linear, 'Linear barcode lower horizontal crop', w * 0.03, h * 0.43, w * 0.94, h * 0.32, ['Code128']),
+      makeTarget(canvas, FORMAT_KIND.mixed, 'Full page safety scan', 0, 0, w, h, ['Code128', 'QRCode'])
+    ];
+  }
+  return [
+    makeTarget(canvas, FORMAT_KIND.linear, 'eParcel primary linear barcode crop', w * 0.04, h * 0.23, w * 0.62, h * 0.22, ['Code128']),
+    makeTarget(canvas, FORMAT_KIND.mixed, 'Full page safety scan', 0, 0, w, h, ['Code128', 'DataMatrix'])
   ];
-  return targets;
 }
 function buildScanRegions(canvas) {
   const w = canvas.width;
@@ -1305,13 +1315,14 @@ async function scanTargetWithAllEngines(target, detector, pageNumber = 1) {
   return found;
 }
 
-async function detectOnCanvas(canvas, detector, pageNumber = 1, onDebug = null) {
+async function detectOnCanvas(canvas, detector, pageNumber = 1, onDebug = null, labelFamily = 'eparcel') {
   const found = [];
   const scanDiagnostics = [];
-  const targets = buildCategorizedScanTargets(canvas);
+  const targets = buildCategorizedScanTargets(canvas, labelFamily);
 
   for (const target of targets) {
-    if (target.kind === FORMAT_KIND.mixed && dedupeBarcodes(found).length >= 2) {
+    if (target.kind === FORMAT_KIND.mixed && shouldSkipFullPageSafetyScan(found, labelFamily)) {
+      const decodedCount = dedupeBarcodes(found).length;
       const skipped = {
         pageNumber,
         kind: target.kind,
@@ -1325,7 +1336,7 @@ async function detectOnCanvas(canvas, detector, pageNumber = 1, onDebug = null) 
         skipped: true
       };
       scanDiagnostics.push(skipped);
-      onDebug?.(`Skipped ${target.label}; targeted scans already found ${dedupeBarcodes(found).length} barcode candidate(s)`, 0);
+      onDebug?.(`Skipped ${target.label}; targeted scans already found ${decodedCount} barcode candidate(s)`, 0);
       continue;
     }
 
@@ -1342,10 +1353,16 @@ async function detectOnCanvas(canvas, detector, pageNumber = 1, onDebug = null) 
       width: target.canvas.width,
       height: target.canvas.height,
       decodedValues: decoded.map(d => d.rawValue),
+      decodedSources: decoded.map(d => ({
+        source: d.source || 'Unknown detector',
+        format: d.format || d.symbology || 'unknown format',
+        variantLabel: d.variantLabel || '',
+        rawValue: d.rawValue || ''
+      })),
       durationMs
     });
     if (decoded.length || durationMs >= 1000) {
-      onDebug?.(`Scan target "${target.label}" found ${decoded.length} candidate${decoded.length === 1 ? '' : 's'}`, durationMs);
+      onDebug?.(`Scan target "${target.label}" found ${decoded.length} candidate${decoded.length === 1 ? '' : 's'}: ${detectorResultSummary(decoded)}`, durationMs);
     }
     if (decoded.length && target.kind !== FORMAT_KIND.mixed) {
       console.info(`Decoded ${decoded.length} barcode(s) from ${target.label}`);
@@ -1357,7 +1374,7 @@ async function detectOnCanvas(canvas, detector, pageNumber = 1, onDebug = null) 
   return { barcodes, scanDiagnostics };
 }
 
-async function processImage(file, detector, onDebug = null) {
+async function processImage(file, detector, onDebug = null, labelFamily = 'eparcel') {
   const fileStart = performance.now();
   const mark = (message, startedAt = fileStart) => onDebug?.(message, performance.now() - startedAt);
   const imgUrl = URL.createObjectURL(file);
@@ -1381,7 +1398,7 @@ async function processImage(file, detector, onDebug = null) {
   mark('Checked visual barcode evidence', visualStart);
   await yieldToBrowser();
   const scanStart = performance.now();
-  const scanResult = await detectOnCanvas(canvas, detector, 1, mark);
+  const scanResult = await detectOnCanvas(canvas, detector, 1, mark, labelFamily);
   const detected = scanResult.barcodes;
   mark(`Decoded barcode candidates (${detected.length})`, scanStart);
   await yieldToBrowser();
@@ -1409,7 +1426,7 @@ async function processImage(file, detector, onDebug = null) {
   };
 }
 
-async function processPdfLabels(file, detector, onDebug = null) {
+async function processPdfLabels(file, detector, onDebug = null, labelFamily = 'eparcel') {
   const fileStart = performance.now();
   const mark = (message, startedAt = fileStart) => onDebug?.(message, performance.now() - startedAt);
   const bufferStart = performance.now();
@@ -1454,7 +1471,7 @@ async function processPdfLabels(file, detector, onDebug = null) {
     mark(`Checked visual barcode evidence on page ${pageNumber}`, visualStart);
     await yieldToBrowser();
     const scanStart = performance.now();
-    const pageScan = await detectOnCanvas(canvas, detector, pageNumber, mark);
+    const pageScan = await detectOnCanvas(canvas, detector, pageNumber, mark, labelFamily);
     const detected = dedupeBarcodes(pageScan.barcodes || []);
     mark(`Decoded page ${pageNumber} barcode candidates (${detected.length})`, scanStart);
     await yieldToBrowser();
@@ -2539,8 +2556,8 @@ function App() {
         const fileDebug = (message, durationMs = null) => appendScanDebug(`${fileDebugPrefix} - ${message}`, durationMs);
         setMessage(`Scanning ${carrierLabel} file ${i + 1} of ${batches.length}: ${currentFile.name}`);
         const dataItems = currentFile.type === 'application/pdf' || currentFile.name.toLowerCase().endsWith('.pdf')
-          ? await processPdfLabels(currentFile, detector, fileDebug)
-          : [await processImage(currentFile, detector, fileDebug)];
+          ? await processPdfLabels(currentFile, detector, fileDebug, labelFamily)
+          : [await processImage(currentFile, detector, fileDebug, labelFamily)];
         appendScanDebug(`${fileDebugPrefix} - finished render/scan phase`, performance.now() - fileTimer);
 
         for (let pageIndex = 0; pageIndex < dataItems.length; pageIndex += 1) {
@@ -2566,9 +2583,8 @@ function App() {
         }
       }
       setActiveIndex(0);
-      const totalDecoded = nextAudits.reduce((sum, audit) => sum + (audit.detectedBarcodes?.length || 0), 0);
       appendScanDebug('Completed audit batch', performance.now() - auditStart);
-      setMessage(`Audit complete. ${nextAudits.length} label(s) processed with ${totalDecoded} decoded barcode string(s).`);
+      setMessage('');
       setTimeout(() => document.getElementById('audit-result')?.scrollIntoView({ block: 'start' }), 0);
     } catch (error) {
       console.error(error);
@@ -2640,8 +2656,8 @@ function App() {
           </label>
         </div>
         <div className="optional-input-grid">
-          <details className="payload-input-panel">
-            <summary>Get Shipments API payload comparison</summary>
+          <section className="payload-input-panel" aria-labelledby="payload-input-title">
+            <h2 id="payload-input-title">Get Shipments API payload comparison</h2>
             <p className="muted small">Optional: paste a Get Shipments response before upload, or apply it to the current report.</p>
             <textarea
               className="api-payload-textarea"
@@ -2659,7 +2675,7 @@ function App() {
               value={manifestJson}
               onChange={e => setManifestJson(e.target.value)}
             />
-          </details>
+          </section>
           <section className="sscc-prefix-panel" aria-labelledby="sscc-prefix-title">
             <h2 id="sscc-prefix-title">SSCC GS1 Company Prefix</h2>
             <p className="muted small">Optional. When supplied, eParcel and StarTrack labels are assessed as SSCC labels and the decoded AI 00 barcode must match this prefix.</p>
@@ -2692,39 +2708,12 @@ function App() {
 
       {!processing && message && <section className="message" aria-live="polite">{message}</section>}
 
-      {scanDebugLines.length > 0 && (
-        <section className="card scan-debug-card">
-          <details open={processing}>
-            <summary>
-              Debug timing log
-            </summary>
-            <label className="scan-debug-label" htmlFor="scan-debug-log">Full timing log</label>
-            <textarea
-              id="scan-debug-log"
-              className="scan-debug-log"
-              rows="8"
-              readOnly
-              value={scanDebugText}
-              placeholder="Timing events will appear here while files are processed."
-            />
-          </details>
-        </section>
-      )}
-
       {audits.length > 0 && (
         <section className="results">
-          <div className="summary card compact-card consolidated-summary">
+          <div className={`summary card compact-card consolidated-summary summary-${batchSummary.overallStatus.toLowerCase()}`}>
             <div>
               <SectionTitle id="audit-result">Audit result</SectionTitle>
               <p className={`overall overall-${batchSummary.overallStatus.toLowerCase()}`}>{batchSummary.overallStatus}</p>
-              <p className="muted small">Consolidated result across {batchSummary.labelCount} uploaded label(s).</p>
-            </div>
-            <div className="summary-grid compact-summary">
-              <span>Labels: {batchSummary.labelCount}</span>
-              <span>Passed checks: {batchSummary.passed}</span>
-              <span>Failed checks: {batchSummary.failed}</span>
-              <span>Review checks: {batchSummary.manualReview}</span>
-              <span>Decoded barcodes: {batchSummary.decoded}</span>
             </div>
           </div>
 
@@ -2792,6 +2781,25 @@ function App() {
               </section>
             );
           })()}
+        </section>
+      )}
+
+      {scanDebugLines.length > 0 && (
+        <section className="card scan-debug-card">
+          <details open={processing}>
+            <summary>
+              Debug timing log
+            </summary>
+            <label className="scan-debug-label" htmlFor="scan-debug-log">Full timing log</label>
+            <textarea
+              id="scan-debug-log"
+              className="scan-debug-log"
+              rows="8"
+              readOnly
+              value={scanDebugText}
+              placeholder="Timing events will appear here while files are processed."
+            />
+          </details>
         </section>
       )}
       <ImageZoomModal image={zoomImage} onClose={() => setZoomImage(null)} />

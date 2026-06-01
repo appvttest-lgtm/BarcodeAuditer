@@ -490,10 +490,38 @@ figcaption { color: #666; font-size: 12px; margin-top: 6px; }
 }
 .file-list li { margin: 3px 0; }
 .consolidated-summary {
-  display: grid;
-  grid-template-columns: 1fr minmax(260px, 1fr) auto;
-  gap: 14px;
-  align-items: center;
+  display: block;
+  border-width: 2px;
+}
+.consolidated-summary h2 {
+  margin-bottom: 4px;
+}
+.consolidated-summary .overall {
+  line-height: 1;
+}
+.summary-pass {
+  border-color: #9fd7b2;
+  background: #edf8f1;
+}
+.summary-pass .overall,
+.summary-pass h2 {
+  color: #087a2e;
+}
+.summary-review {
+  border-color: #f1c96d;
+  background: #fff8e5;
+}
+.summary-review .overall,
+.summary-review h2 {
+  color: #8a5a00;
+}
+.summary-fail {
+  border-color: #f0a3ad;
+  background: #fff0f2;
+}
+.summary-fail .overall,
+.summary-fail h2 {
+  color: #b00020;
 }
 .button-stack {
   display: flex;
@@ -563,7 +591,6 @@ figcaption { color: #666; font-size: 12px; margin-top: 6px; }
 .single-audit-view { animation: fade-in .18s ease-out; }
 @keyframes fade-in { from { opacity: .65; transform: translateY(3px); } to { opacity: 1; transform: none; } }
 @media (max-width: 900px) {
-  .consolidated-summary { grid-template-columns: 1fr; }
   .button-stack { flex-direction: row; flex-wrap: wrap; }
 }
 @media (max-width: 620px) {
@@ -681,6 +708,13 @@ figcaption { color: #666; font-size: 12px; margin-top: 6px; }
 /* Optional Get Shipments payload input and match/mismatch badges. */
 .payload-input-panel {
   min-width: 0;
+  border: 1px solid #d8e6f2;
+  background: #f8fbff;
+  border-radius: 12px;
+  padding: 14px;
+}
+.payload-input-panel h2 {
+  margin-bottom: 8px;
 }
 .optional-input-grid {
   grid-column: 1 / -1;
